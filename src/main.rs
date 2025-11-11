@@ -13,6 +13,7 @@ use {
         cmp,
         fs::File,
         collections::HashMap,
+        env,
     },
 
     epg::{
@@ -41,6 +42,11 @@ use {
         Config,
         Schema,
         ConfigError,
+    },
+
+    jiff::{
+        Timestamp,
+        tz::TimeZone,
     },
 };
 
@@ -142,11 +148,97 @@ impl Output {
 }
 
 
-#[derive(Debug, Default)]
+// Static variables to track test time offset
+static mut TEST_TIME_OFFSET: Option<i64> = None;
+static mut TEST_TIME_INIT: bool = false;
+
+// Helper function to get current time (or test time from environment variable)
+fn get_current_time() -> Timestamp {
+    unsafe {
+        if !TEST_TIME_INIT {
+            TEST_TIME_INIT = true;
+
+            if let Ok(test_time_str) = env::var("TEST_TIME") {
+                // Try parsing as RFC3339 first
+                let test_ts = if let Ok(ts) = test_time_str.parse::<Timestamp>() {
+                    Some(ts)
+                } else if let Ok(seconds) = test_time_str.parse::<i64>() {
+                    // Try parsing as Unix timestamp (seconds since epoch)
+                    Timestamp::from_second(seconds).ok()
+                } else {
+                    eprintln!("Warning: Invalid TEST_TIME format '{}', using current time", test_time_str);
+                    None
+                };
+
+                if let Some(test_ts) = test_ts {
+                    let real_now = Timestamp::now();
+                    TEST_TIME_OFFSET = Some(test_ts.as_second() - real_now.as_second());
+                    eprintln!("TEST MODE: Starting from test time: {} (offset: {} seconds from real time)", test_ts, TEST_TIME_OFFSET.unwrap());
+                }
+            }
+        }
+
+        if let Some(offset) = TEST_TIME_OFFSET {
+            let real_now = Timestamp::now();
+            let adjusted_seconds = real_now.as_second() + offset;
+            Timestamp::from_second(adjusted_seconds).unwrap_or(real_now)
+        } else {
+            Timestamp::now()
+        }
+    }
+}
+
+// Helper function to convert offset in seconds to minutes and polarity
+fn seconds_to_offset(seconds: i32) -> (u16, u8) {
+    let minutes = (seconds.abs() / 60) as u16;
+    let polarity = if seconds >= 0 { 0 } else { 1 };
+    (minutes, polarity)
+}
+
+// Helper function to calculate DST info from timezone
+fn calculate_dst_info(tz: &TimeZone) -> Result<(u16, u8, u64, u16)> {
+    let now = get_current_time();
+    let current_offset = tz.to_offset(now);
+    let current_offset_seconds = current_offset.seconds();
+
+    // Find next DST transition using following() iterator
+    let (time_of_change, next_offset_seconds) = if let Some(transition) = tz.following(now).next() {
+        // Get timestamp and next offset
+        let change_ts = transition.timestamp().as_second();
+        let next_off = transition.offset().seconds();
+        (change_ts as u64, next_off)
+    } else {
+        // No future transitions
+        (0, current_offset_seconds)
+    };
+
+    // Convert to minutes and polarity
+    let (offset, offset_polarity) = seconds_to_offset(current_offset_seconds);
+    let (next_offset, _) = seconds_to_offset(next_offset_seconds);
+
+    Ok((offset, offset_polarity, time_of_change, next_offset))
+}
+
+
+#[derive(Debug)]
 struct TdtTot {
     cc: u8,
     tdt: Tdt,
     tot: Tot,
+    timezone: Option<TimeZone>,
+    output: Option<Output>,
+}
+
+impl Default for TdtTot {
+    fn default() -> Self {
+        Self {
+            cc: 0,
+            tdt: Tdt::default(),
+            tot: Tot::default(),
+            timezone: None,
+            output: None,
+        }
+    }
 }
 
 
@@ -154,17 +246,44 @@ impl TdtTot {
     fn parse_config(&mut self, config: &Config) -> Result<()> {
         let country = config.get("country").unwrap_or("   ");
 
-        let (offset, offset_polarity) = {
-            let offset = config.get("offset")
-                .map(parse_offset)
-                .unwrap_or(0);
+        // Check if both timezone and offset are configured
+        let has_timezone = config.get::<&str>("timezone").is_some();
+        let has_offset = config.get::<&str>("offset").is_some();
 
-            if offset >= 0 {
-                (offset as u16, 0)
-            } else {
-                ((-offset) as u16, 1)
-            }
+        if has_timezone && has_offset {
+            eprintln!("Warning: Both 'timezone' and 'offset' are configured in [tdt-tot] section.");
+            eprintln!("         The 'offset' parameter will be ignored. Timezone takes priority.");
+        }
+
+        // Try to load timezone first
+        let tz_result = if let Some(tz_name) = config.get("timezone") {
+            TimeZone::get(tz_name).ok()
+        } else {
+            None
         };
+
+        let (offset, offset_polarity, time_of_change, next_offset) =
+            if let Some(tz) = tz_result {
+                // Calculate from timezone data
+                self.timezone = Some(tz.clone());
+                calculate_dst_info(&tz)?
+            } else {
+                // Fallback to manual offset (backward compatible)
+                if !has_timezone {
+                    eprintln!("Warning: No timezone configured, using manual offset (DST not supported)");
+                }
+                let offset = config.get("offset")
+                    .map(parse_offset)
+                    .unwrap_or(0);
+
+                let (off, pol) = if offset >= 0 {
+                    (offset as u16, 0)
+                } else {
+                    ((-offset) as u16, 1)
+                };
+
+                (off, pol, 0, off)  // No DST transition
+            };
 
         if self.tot.descriptors.is_empty() {
             self.tot.descriptors.push(Desc58::default());
@@ -179,19 +298,57 @@ impl TdtTot {
             region_id: 0,
             offset_polarity,
             offset,
-            time_of_change: 0,
-            next_offset: offset,
+            time_of_change,
+            next_offset,
         });
+
+        // Parse optional separate output for TDT/TOT
+        if let Some(output_addr) = config.get::<&str>("output") {
+            self.output = Some(Output::open(output_addr)?);
+            eprintln!("TDT/TOT configured with separate output: {}", output_addr);
+        }
 
         Ok(())
     }
 
     fn update(&mut self) {
-        let timestamp = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH).unwrap()
-            .as_secs();
+        let timestamp = if env::var("TEST_TIME").is_ok() {
+            // Use test time if set
+            get_current_time().as_second() as u64
+        } else {
+            // Use real system time
+            time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH).unwrap()
+                .as_secs()
+        };
         self.tdt.time = timestamp;
         self.tot.time = timestamp;
+
+        // Check if we need to update the descriptor (crossed DST boundary)
+        if let Some(tz) = &self.timezone {
+            if !self.tot.descriptors.is_empty() {
+                let desc = self.tot.descriptors.get(0).unwrap().downcast_ref::<Desc58>();
+                if let Some(item) = desc.items.first() {
+                    // Check if we've passed the time_of_change
+                    if item.time_of_change > 0 && timestamp >= item.time_of_change {
+                        // Recalculate DST info
+                        if let Ok((new_offset, new_polarity, new_change, new_next)) = calculate_dst_info(tz) {
+                            // Check if offset actually changed
+                            if new_offset != item.offset || new_polarity != item.offset_polarity {
+                                // Update the descriptor
+                                let desc_mut = self.tot.descriptors.get_mut(0).unwrap().downcast_mut::<Desc58>();
+                                if let Some(item_mut) = desc_mut.items.first_mut() {
+                                    item_mut.offset = new_offset;
+                                    item_mut.offset_polarity = new_polarity;
+                                    item_mut.time_of_change = new_change;
+                                    item_mut.next_offset = new_next;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn demux(&mut self, dst: &mut Vec<u8>) {
@@ -364,8 +521,6 @@ struct Service {
 
     present: Eit,
     schedule: Eit,
-
-    ts: Vec<u8>,
 }
 
 
@@ -694,8 +849,25 @@ fn wrap() -> Result<()> {
 
     loop {
         if let Some(tdt_tot) = &mut instance.tdt_tot {
-            tdt_tot.demux(&mut ts_buffer);
-            fill_null_ts(&mut ts_buffer);
+            // Check if TDT/TOT has separate output configured
+            let has_separate_output = tdt_tot.output.is_some();
+
+            if has_separate_output {
+                // Send TDT/TOT to separate output
+                let mut tdt_buffer = Vec::<u8>::with_capacity(ts::PACKET_SIZE * 10);
+                tdt_tot.demux(&mut tdt_buffer);
+                fill_null_ts(&mut tdt_buffer);
+
+                if !tdt_buffer.is_empty() {
+                    if let Some(ref mut tdt_output) = tdt_tot.output {
+                        tdt_output.send(&tdt_buffer).unwrap();
+                    }
+                }
+            } else {
+                // Send TDT/TOT to main output (default behavior)
+                tdt_tot.demux(&mut ts_buffer);
+                fill_null_ts(&mut ts_buffer);
+            }
         }
 
         for service in &mut instance.service_list {

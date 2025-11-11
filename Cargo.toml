@@ -8,6 +8,7 @@ edition = "2018"
 [dependencies]
 error-rules = "0.2"
 chrono = "0.4"
+jiff = "0.2.16"
 config = { git = "ssh://git@github.com/cesbo/libconfig.git", branch = "master" }
 udp = { git = "ssh://git@github.com/cesbo/libudp.git", branch = "master" }
 mpegts = { git = "ssh://git@github.com/cesbo/libmpegts.git", branch = "master" }
