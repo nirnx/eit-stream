@@ -13,7 +13,6 @@ use {
         cmp,
         fs::File,
         collections::HashMap,
-        env,
     },
 
     epg::{
@@ -148,46 +147,6 @@ impl Output {
 }
 
 
-// Static variables to track test time offset
-static mut TEST_TIME_OFFSET: Option<i64> = None;
-static mut TEST_TIME_INIT: bool = false;
-
-// Helper function to get current time (or test time from environment variable)
-fn get_current_time() -> Timestamp {
-    unsafe {
-        if !TEST_TIME_INIT {
-            TEST_TIME_INIT = true;
-
-            if let Ok(test_time_str) = env::var("TEST_TIME") {
-                // Try parsing as RFC3339 first
-                let test_ts = if let Ok(ts) = test_time_str.parse::<Timestamp>() {
-                    Some(ts)
-                } else if let Ok(seconds) = test_time_str.parse::<i64>() {
-                    // Try parsing as Unix timestamp (seconds since epoch)
-                    Timestamp::from_second(seconds).ok()
-                } else {
-                    eprintln!("Warning: Invalid TEST_TIME format '{}', using current time", test_time_str);
-                    None
-                };
-
-                if let Some(test_ts) = test_ts {
-                    let real_now = Timestamp::now();
-                    TEST_TIME_OFFSET = Some(test_ts.as_second() - real_now.as_second());
-                    eprintln!("TEST MODE: Starting from test time: {} (offset: {} seconds from real time)", test_ts, TEST_TIME_OFFSET.unwrap());
-                }
-            }
-        }
-
-        if let Some(offset) = TEST_TIME_OFFSET {
-            let real_now = Timestamp::now();
-            let adjusted_seconds = real_now.as_second() + offset;
-            Timestamp::from_second(adjusted_seconds).unwrap_or(real_now)
-        } else {
-            Timestamp::now()
-        }
-    }
-}
-
 // Helper function to convert offset in seconds to minutes and polarity
 fn seconds_to_offset(seconds: i32) -> (u16, u8) {
     let minutes = (seconds.abs() / 60) as u16;
@@ -195,9 +154,8 @@ fn seconds_to_offset(seconds: i32) -> (u16, u8) {
     (minutes, polarity)
 }
 
-// Helper function to calculate DST info from timezone
-fn calculate_dst_info(tz: &TimeZone) -> Result<(u16, u8, u64, u16)> {
-    let now = get_current_time();
+// Helper function to calculate DST info from timezone at a given point in time
+fn calculate_dst_info(tz: &TimeZone, now: Timestamp) -> Result<(u16, u8, u64, u16)> {
     let current_offset = tz.to_offset(now);
     let current_offset_seconds = current_offset.seconds();
 
@@ -266,7 +224,7 @@ impl TdtTot {
             if let Some(tz) = tz_result {
                 // Calculate from timezone data
                 self.timezone = Some(tz.clone());
-                calculate_dst_info(&tz)?
+                calculate_dst_info(&tz, Timestamp::now())?
             } else {
                 // Fallback to manual offset (backward compatible)
                 if !has_timezone {
@@ -312,15 +270,12 @@ impl TdtTot {
     }
 
     fn update(&mut self) {
-        let timestamp = if env::var("TEST_TIME").is_ok() {
-            // Use test time if set
-            get_current_time().as_second() as u64
-        } else {
-            // Use real system time
-            time::SystemTime::now()
-                .duration_since(time::UNIX_EPOCH).unwrap()
-                .as_secs()
-        };
+        let now = Timestamp::now();
+        self.update_at(now);
+    }
+
+    fn update_at(&mut self, now: Timestamp) {
+        let timestamp = now.as_second() as u64;
         self.tdt.time = timestamp;
         self.tot.time = timestamp;
 
@@ -332,7 +287,7 @@ impl TdtTot {
                     // Check if we've passed the time_of_change
                     if item.time_of_change > 0 && timestamp >= item.time_of_change {
                         // Recalculate DST info
-                        if let Ok((new_offset, new_polarity, new_change, new_next)) = calculate_dst_info(tz) {
+                        if let Ok((new_offset, new_polarity, new_change, new_next)) = calculate_dst_info(tz, now) {
                             // Check if offset actually changed
                             if new_offset != item.offset || new_polarity != item.offset_polarity {
                                 // Update the descriptor
@@ -938,5 +893,220 @@ fn wrap() -> Result<()> {
 fn main() {
     if let Err(e) = wrap() {
         println!("{}", e.to_string());
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: create a TdtTot with a timezone and initial descriptor set at a given time
+    fn make_tdt_tot_at(tz_name: &str, country: &str, now: Timestamp) -> TdtTot {
+        let tz = TimeZone::get(tz_name).unwrap();
+        let (offset, offset_polarity, time_of_change, next_offset) =
+            calculate_dst_info(&tz, now).unwrap();
+
+        let mut tdt_tot = TdtTot::default();
+        tdt_tot.timezone = Some(tz);
+        tdt_tot.tot.descriptors.push(Desc58::default());
+
+        let desc = tdt_tot.tot.descriptors
+            .get_mut(0).unwrap()
+            .downcast_mut::<Desc58>();
+
+        desc.items.push(Desc58i {
+            country_code: textcode::StringDVB::from_str(country, textcode::ISO6937),
+            region_id: 0,
+            offset_polarity,
+            offset,
+            time_of_change,
+            next_offset,
+        });
+
+        tdt_tot
+    }
+
+    fn get_desc58i(tdt_tot: &mut TdtTot) -> Desc58i {
+        let desc = tdt_tot.tot.descriptors
+            .get(0).unwrap()
+            .downcast_ref::<Desc58>();
+        desc.items.first().unwrap().clone()
+    }
+
+    // --- seconds_to_offset ---
+
+    #[test]
+    fn seconds_to_offset_positive() {
+        // UTC+1 (3600s) → 60 minutes, polarity 0
+        let (minutes, polarity) = seconds_to_offset(3600);
+        assert_eq!(minutes, 60);
+        assert_eq!(polarity, 0);
+    }
+
+    #[test]
+    fn seconds_to_offset_negative() {
+        // UTC-5 (-18000s) → 300 minutes, polarity 1
+        let (minutes, polarity) = seconds_to_offset(-18000);
+        assert_eq!(minutes, 300);
+        assert_eq!(polarity, 1);
+    }
+
+    #[test]
+    fn seconds_to_offset_zero() {
+        let (minutes, polarity) = seconds_to_offset(0);
+        assert_eq!(minutes, 0);
+        assert_eq!(polarity, 0);
+    }
+
+    #[test]
+    fn seconds_to_offset_half_hour() {
+        // UTC+5:30 (India) = 19800s → 330 minutes
+        let (minutes, polarity) = seconds_to_offset(19800);
+        assert_eq!(minutes, 330);
+        assert_eq!(polarity, 0);
+    }
+
+    // --- calculate_dst_info ---
+
+    #[test]
+    fn dst_info_warsaw_winter() {
+        // 2025-01-15 12:00 UTC — Warsaw is CET (UTC+1), no DST
+        let now = Timestamp::from_second(1736942400).unwrap();
+        let tz = TimeZone::get("Europe/Warsaw").unwrap();
+        let (offset, polarity, time_of_change, next_offset) =
+            calculate_dst_info(&tz, now).unwrap();
+
+        assert_eq!(offset, 60);     // CET = UTC+1 = 60 min
+        assert_eq!(polarity, 0);    // positive (east)
+        assert!(time_of_change > 0); // next DST transition exists
+        assert_eq!(next_offset, 120); // CEST = UTC+2 = 120 min
+    }
+
+    #[test]
+    fn dst_info_warsaw_summer() {
+        // 2025-07-15 12:00 UTC — Warsaw is CEST (UTC+2)
+        let now = Timestamp::from_second(1752580800).unwrap();
+        let tz = TimeZone::get("Europe/Warsaw").unwrap();
+        let (offset, polarity, time_of_change, next_offset) =
+            calculate_dst_info(&tz, now).unwrap();
+
+        assert_eq!(offset, 120);    // CEST = UTC+2 = 120 min
+        assert_eq!(polarity, 0);
+        assert!(time_of_change > 0);
+        assert_eq!(next_offset, 60); // back to CET
+    }
+
+    #[test]
+    fn dst_info_new_york_winter() {
+        // 2025-01-15 12:00 UTC — New York is EST (UTC-5)
+        let now = Timestamp::from_second(1736942400).unwrap();
+        let tz = TimeZone::get("America/New_York").unwrap();
+        let (offset, polarity, time_of_change, next_offset) =
+            calculate_dst_info(&tz, now).unwrap();
+
+        assert_eq!(offset, 300);    // EST = 5 hours = 300 min
+        assert_eq!(polarity, 1);    // negative (west)
+        assert!(time_of_change > 0);
+        assert_eq!(next_offset, 240); // EDT = 4 hours
+    }
+
+    #[test]
+    fn dst_info_utc_no_transitions() {
+        let now = Timestamp::from_second(1736942400).unwrap();
+        let tz = TimeZone::get("UTC").unwrap();
+        let (offset, polarity, time_of_change, _next_offset) =
+            calculate_dst_info(&tz, now).unwrap();
+
+        assert_eq!(offset, 0);
+        assert_eq!(polarity, 0);
+        assert_eq!(time_of_change, 0); // UTC has no DST transitions
+    }
+
+    // --- TdtTot::update_at — timestamp propagation ---
+
+    #[test]
+    fn update_at_sets_tdt_tot_time() {
+        let now = Timestamp::from_second(1736942400).unwrap();
+        let mut tdt_tot = TdtTot::default();
+        tdt_tot.update_at(now);
+
+        assert_eq!(tdt_tot.tdt.time, 1736942400);
+        assert_eq!(tdt_tot.tot.time, 1736942400);
+    }
+
+    // --- TdtTot::update_at — DST boundary crossing ---
+
+    #[test]
+    fn update_at_crosses_dst_boundary() {
+        // Warsaw: CET→CEST typically last Sunday of March at 01:00 UTC
+        // 2025-03-30 01:00 UTC is the spring transition
+        // Set up in winter, just before transition
+        let before_dst = Timestamp::from_second(1743296400 - 3600).unwrap(); // 1h before transition
+        let mut tdt_tot = make_tdt_tot_at("Europe/Warsaw", "POL", before_dst);
+
+        // Verify initial state: CET (UTC+1)
+        let item = get_desc58i(&mut tdt_tot);
+        assert_eq!(item.offset, 60);
+        assert_eq!(item.offset_polarity, 0);
+        assert_eq!(item.next_offset, 120); // upcoming CEST
+
+        // Now simulate time passing the DST boundary
+        let after_dst = Timestamp::from_second(1743296400 + 60).unwrap(); // 1 min after transition
+        tdt_tot.update_at(after_dst);
+
+        // Descriptor should have been updated to CEST (UTC+2)
+        let item = get_desc58i(&mut tdt_tot);
+        assert_eq!(item.offset, 120);     // now CEST
+        assert_eq!(item.offset_polarity, 0);
+        assert_eq!(item.next_offset, 60); // next transition back to CET
+    }
+
+    #[test]
+    fn update_at_no_crossing_keeps_descriptor() {
+        // Set up in winter, stay in winter
+        let winter = Timestamp::from_second(1736942400).unwrap(); // 2025-01-15
+        let mut tdt_tot = make_tdt_tot_at("Europe/Warsaw", "POL", winter);
+
+        let item = get_desc58i(&mut tdt_tot);
+        let original_offset = item.offset;
+        let original_change = item.time_of_change;
+
+        // Update still in winter — no crossing
+        let still_winter = Timestamp::from_second(1736942400 + 86400).unwrap(); // next day
+        tdt_tot.update_at(still_winter);
+
+        let item = get_desc58i(&mut tdt_tot);
+        assert_eq!(item.offset, original_offset);
+        assert_eq!(item.time_of_change, original_change);
+    }
+
+    // --- Manual offset (no timezone) ---
+
+    #[test]
+    fn manual_offset_no_dst_fields() {
+        // Simulate what parse_config does for manual offset (no timezone)
+        let mut tdt_tot = TdtTot::default();
+        tdt_tot.tot.descriptors.push(Desc58::default());
+
+        let offset: u16 = 300;
+        let desc = tdt_tot.tot.descriptors
+            .get_mut(0).unwrap()
+            .downcast_mut::<Desc58>();
+
+        desc.items.push(Desc58i {
+            country_code: textcode::StringDVB::from_str("USA", textcode::ISO6937),
+            region_id: 0,
+            offset_polarity: 1, // west
+            offset,
+            time_of_change: 0,
+            next_offset: offset,
+        });
+
+        let item = get_desc58i(&mut tdt_tot);
+        assert_eq!(item.offset, 300);
+        assert_eq!(item.offset_polarity, 1);
+        assert_eq!(item.time_of_change, 0);
+        assert_eq!(item.next_offset, 300); // same as current — no DST
     }
 }
